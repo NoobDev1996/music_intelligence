@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Scene Intelligence Engine v12</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+</head>
+
+<body class="bg-black text-white">
+
+<div class="p-4 max-w-7xl mx-auto">
+
+  <!-- HEADER -->
+  <div class="bg-zinc-900 p-6 rounded-3xl mb-4">
+    <h1 class="text-4xl font-bold text-center">🎧 Scene Intelligence Engine v12</h1>
+    <p class="text-center text-gray-400 mt-2">
+      Graph + camera + expansion + track discovery system
+    </p>
+
+    <div class="flex flex-wrap justify-center gap-3 mt-6">
+
+      <select id="tag" class="p-3 bg-zinc-800 rounded-xl">
+        <option value="post-hardcore">Post-Hardcore</option>
+        <option value="metalcore">Metalcore</option>
+        <option value="deathcore">Deathcore</option>
+        <option value="trancecore">Trancecore</option>
+        <option value="hardcore">Hardcore</option>
+      </select>
+
+      <button id="tagBtn" class="bg-red-600 px-4 py-3 rounded-xl font-bold">
+        Build Scene
+      </button>
+
+      <input id="search" class="p-3 bg-zinc-800 rounded-xl w-64"
+        placeholder="Search band (e.g. Underoath)" />
+
+      <button id="searchBtn" class="bg-green-600 px-4 py-3 rounded-xl font-bold">
+        Search Seed
+      </button>
+
+    </div>
+  </div>
+
+  <svg id="graph" width="100%" height="650"></svg>
+
+  <!-- TRACK PANEL -->
+  <div class="mt-4 bg-zinc-900 p-4 rounded-xl">
+    <h2 class="text-xl font-bold mb-2">🎵 Top Tracks</h2>
+    <div id="tracks" class="text-sm text-gray-300 space-y-1"></div>
+  </div>
+
+</div>
+
+<script>
+
+const API_KEY = "5700d3bb0e4afd6b0ade68fc4b4e29ed";
+
+const svg = d3.select("#graph");
+const width = window.innerWidth;
+const height = 650;
+
+svg.attr("viewBox", `0 0 ${width} ${height}`);
+
+const g = svg.append("g");
+
+// ----------------------
+// STATE
+// ----------------------
+let nodes = new Map();
+let links = [];
+let expanded = new Set();
+let trackCache = new Map();
+
+// ----------------------
+// ZOOM + CAMERA
+// ----------------------
+const zoom = d3.zoom()
+  .scaleExtent([0.4, 4])
+  .on("zoom", (event) => {
+    g.attr("transform", event.transform);
+  });
+
+svg.call(zoom);
+
+svg.call(
+  zoom.transform,
+  d3.zoomIdentity
+    .translate(width / 3, height / 3)
+    .scale(1.4)
+);
+
+// ----------------------
+// FORCE SIMULATION
+// ----------------------
+const simulation = d3.forceSimulation()
+  .force("link", d3.forceLink().id(d => d.id).strength(0.25))
+  .force("charge", d3.forceManyBody().strength(-140))
+  .force("center", d3.forceCenter(width/2, height/2));
+
+// ----------------------
+// API
+// ----------------------
+async function getArtist(name){
+  const r = await fetch(
+    `https://ws.audioscrobbler.com/2.0/?method=artist.getinfo&artist=${encodeURIComponent(name)}&api_key=${API_KEY}&format=json`
+  );
+  return r.json();
+}
+
+async function getSimilar(name){
+  const r = await fetch(
+    `https://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist=${encodeURIComponent(name)}&api_key=${API_KEY}&format=json&limit=10`
+  );
+  return r.json();
+}
+
+async function getTopTracks(artist){
+  const r = await fetch(
+    `https://ws.audioscrobbler.com/2.0/?method=artist.gettoptracks&artist=${encodeURIComponent(artist)}&api_key=${API_KEY}&format=json`
+  );
+  return r.json();
+}
+
+// ----------------------
+// UTIL
+// ----------------------
+function parse(n){
+  return parseInt((n || "0").replace(/,/g,"")) || 0;
+}
+
+// ----------------------
+// CAMERA FOCUS
+// ----------------------
+function focusNode(id) {
+
+  const node = nodes.get(id);
+  if (!node || !node.x || !node.y) return;
+
+  svg.transition().duration(600).call(
+    zoom.transform,
+    d3.zoomIdentity
+      .translate(width / 2 - node.x, height / 2 - node.y)
+      .scale(1.6)
+  );
+}
+
+// ----------------------
+// TRACK RENDER
+// ----------------------
+function renderTracks(tracks, artist) {
+
+  const container = document.getElementById("tracks");
+
+  container.innerHTML = `<div class="text-gray-400 mb-2">
+    ${artist} — Top Tracks
+  </div>`;
+
+  tracks.slice(0, 8).forEach(t => {
+    container.innerHTML += `
+      <div class="flex justify-between border-b border-zinc-800 py-1">
+        <span>🎧 ${t.name}</span>
+        <span class="text-gray-500">${parse(t.playcount).toLocaleString()}</span>
+      </div>
+    `;
+  });
+}
+
+// ----------------------
+// NODE ADD
+// ----------------------
+function addNode(id, listeners = 0) {
+  if (!nodes.has(id)) {
+    nodes.set(id, { id, listeners });
+  }
+}
+
+// ----------------------
+// EXPAND ENGINE
+// ----------------------
+async function expand(name) {
+
+  if (expanded.has(name)) return;
+  expanded.add(name);
+
+  const res = await getArtist(name);
+  const artist = res.artist;
+  if (!artist) return;
+
+  addNode(artist.name, parse(artist.stats?.listeners));
+
+  const sim = await getSimilar(name);
+  const similar = sim.similarartists?.artist || [];
+
+  for (let s of similar) {
+
+    const r = await getArtist(s.name);
+    const a = r.artist;
+    if (!a) continue;
+
+    addNode(a.name, parse(a.stats?.listeners));
+
+    links.push({
+      source: artist.name,
+      target: a.name
+    });
+  }
+
+  render();
+}
+
+// ----------------------
+// TAG BUILD
+// ----------------------
+async function buildTag(tag) {
+
+  nodes.clear();
+  links = [];
+  expanded.clear();
+
+  const res = await fetch(
+    `https://ws.audioscrobbler.com/2.0/?method=tag.gettopartists&tag=${tag}&api_key=${API_KEY}&format=json&limit=10`
+  );
+
+  const data = await res.json();
+
+  for (let a of data.topartists.artist) {
+    await expand(a.name);
+  }
+}
+
+// ----------------------
+// RENDER (STABLE)
+// ----------------------
+function render() {
+
+  const nodeArray = Array.from(nodes.values());
+
+  simulation.nodes(nodeArray);
+  simulation.force("link").links(links);
+  simulation.alpha(1).restart();
+
+  // LINKS
+  const link = g.selectAll("line")
+    .data(links, d => d.source.id + "-" + d.target.id);
+
+  link.exit().remove();
+
+  link.enter()
+    .append("line")
+    .attr("stroke", "#333")
+    .merge(link);
+
+  // NODES
+  const node = g.selectAll("circle")
+    .data(nodeArray, d => d.id);
+
+  node.exit().remove();
+
+  const nodeEnter = node.enter()
+    .append("circle")
+    .attr("r", d => Math.max(4, 10 - Math.log10(d.listeners + 10)))
+    .attr("fill", "#22c55e")
+    .on("click", async (event, d) => {
+
+      await expand(d.id);
+      focusNode(d.id);
+
+      // TRACK CACHE
+      if (!trackCache.has(d.id)) {
+        const t = await getTopTracks(d.id);
+        trackCache.set(d.id, t.toptracks?.track || []);
+      }
+
+      renderTracks(trackCache.get(d.id), d.id);
+    })
+    .call(d3.drag()
+      .on("start", dragStart)
+      .on("drag", dragged)
+      .on("end", dragEnd)
+    );
+
+  nodeEnter.merge(node);
+
+  // LABELS
+  const labels = g.selectAll("text")
+    .data(nodeArray, d => d.id);
+
+  labels.exit().remove();
+
+  labels.enter()
+    .append("text")
+    .text(d => d.id)
+    .attr("font-size", "10px")
+    .attr("fill", "#aaa")
+    .merge(labels);
+
+  // TICK
+  simulation.on("tick", () => {
+
+    g.selectAll("line")
+      .attr("x1", d => d.source.x)
+      .attr("y1", d => d.source.y)
+      .attr("x2", d => d.target.x)
+      .attr("y2", d => d.target.y);
+
+    g.selectAll("circle")
+      .attr("cx", d => d.x)
+      .attr("cy", d => d.y);
+
+    g.selectAll("text")
+      .attr("x", d => d.x + 6)
+      .attr("y", d => d.y + 3);
+
+  });
+}
+
+// ----------------------
+// UI
+// ----------------------
+document.getElementById("tagBtn").onclick = () => {
+  buildTag(document.getElementById("tag").value);
+};
+
+document.getElementById("searchBtn").onclick = () => {
+
+  const q = document.getElementById("search").value.trim();
+  if (!q) return;
+
+  nodes.clear();
+  links = [];
+  expanded.clear();
+
+  expand(q);
+  focusNode(q);
+};
+
+// ----------------------
+// DRAG
+// ----------------------
+function dragStart(event, d) {
+  if (!event.active) simulation.alphaTarget(0.3).restart();
+  d.fx = d.x;
+  d.fy = d.y;
+}
+
+function dragged(event, d) {
+  d.fx = event.x;
+  d.fy = event.y;
+}
+
+function dragEnd(event, d) {
+  if (!event.active) simulation.alphaTarget(0);
+  d.fx = null;
+  d.fy = null;
+}
+
+</script>
+
+</body>
+</html>
